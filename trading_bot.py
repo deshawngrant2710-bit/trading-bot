@@ -54,9 +54,9 @@ CANDLE_TICKS   = 6
 
 # Friendly market names -> Deriv symbols (SIM = offline simulator)
 MARKETS = {
+    "frxEURUSD": "EUR/USD", "frxGBPJPY": "GBP/JPY", "frxXAUUSD": "Gold",
     "R_75": "Volatility 75", "R_100": "Volatility 100", "R_50": "Volatility 50",
     "R_25": "Volatility 25", "R_10": "Volatility 10",
-    "frxEURUSD": "EUR/USD", "frxGBPJPY": "GBP/JPY", "frxXAUUSD": "Gold",
     "SIM": "Simulator (offline)",
 }
 
@@ -146,7 +146,7 @@ class TradingBot:
         self.running = False
         self.lot = 0.10
         self.source = "deriv"
-        self.symbol = "R_75"
+        self.symbol = "frxEURUSD"
         self.gran = GRAN
         self.balance = START_BALANCE
         self.trades = []
@@ -581,7 +581,7 @@ def api_lot():
 
 @app.route("/api/symbol", methods=["POST"])
 def api_symbol():
-    bot.set_symbol(request.json.get("symbol", "R_75")); return jsonify(ok=True, symbol=bot.symbol)
+    bot.set_symbol(request.json.get("symbol", "frxEURUSD")); return jsonify(ok=True, symbol=bot.symbol)
 
 
 @app.route("/api/analyze")
@@ -670,7 +670,13 @@ PAGE = r"""<!doctype html>
     <button class="ghost" onclick="call('reset')">Reset</button>
   </div>
 
-  <h2>Live chart &amp; strategy</h2>
+  <h2>Live chart</h2>
+  <div class="panel pad">
+    <div id="tvnote" class="feed" style="display:none"></div>
+    <div id="tvwrap" class="chartbox" style="padding:0;height:380px"><div id="tv_chart" style="height:380px"></div></div>
+  </div>
+
+  <h2>Strategy chart (sweeps &amp; trades)</h2>
   <div class="panel pad">
     <div class="botstate" id="botstate">Pick a market and press Start.</div>
     <div class="feed" id="feed"></div>
@@ -722,16 +728,30 @@ PAGE = r"""<!doctype html>
   <div class="note">Bot = liquidity-sweep on live Deriv data (paper) · Analyzer = real daily ECB rates</div>
 </div>
 
+<script src="https://s3.tradingview.com/tv.js"></script>
 <script>
 const $=id=>document.getElementById(id);
 const money=n=>(n>=0?'+':'')+n.toFixed(2);
 const cls=n=>n>=0?'up':'down';
 const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim();
 let symTouched=false;
+const TV_MAP={frxEURUSD:'OANDA:EURUSD',frxGBPJPY:'OANDA:GBPJPY',frxXAUUSD:'OANDA:XAUUSD'};
+let tvCur=null;
+function renderTV(sym){
+  const tv=TV_MAP[sym];
+  if(!tv){ tvCur=null; $('tvwrap').style.display='none'; $('tvnote').style.display='block';
+    $('tvnote').textContent="TradingView doesn't carry Deriv synthetic indices — watch this market on the strategy chart below (press Start)."; return; }
+  if(typeof TradingView==='undefined'){ $('tvwrap').style.display='none'; $('tvnote').style.display='block';
+    $('tvnote').textContent='Couldn\'t load TradingView (a browser ad-blocker or the network may be blocking it).'; return; }
+  if(tv===tvCur){ $('tvwrap').style.display='block'; $('tvnote').style.display='none'; return; }
+  tvCur=tv; $('tvnote').style.display='none'; $('tvwrap').style.display='block'; $('tv_chart').innerHTML='';
+  new TradingView.widget({container_id:'tv_chart',symbol:tv,interval:'1',timezone:'Etc/UTC',theme:'dark',
+    style:'1',locale:'en',autosize:true,hide_side_toolbar:true,allow_symbol_change:false});
+}
 
 async function call(a){ await fetch('/api/'+a,{method:'POST'}); refresh(); }
 async function setLot(){ await fetch('/api/lot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lot:parseFloat($('lot').value)||0.1})}); }
-async function setSymbol(){ symTouched=true; await fetch('/api/symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value})}); refresh(); }
+async function setSymbol(){ symTouched=true; await fetch('/api/symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:$('symbol').value})}); renderTV($('symbol').value); refresh(); }
 
 function drawCandles(s){
   const c=s.candles||[]; const svg=$('botchart');
@@ -763,6 +783,7 @@ async function refresh(){
   $('state').textContent=s.running?'RUNNING':'STOPPED';
   $('btnStart').disabled=s.running; $('btnStop').disabled=!s.running;
   if(!symTouched && s.symbol) $('symbol').value=s.symbol;
+  renderTV($('symbol').value);
   $('botstate').textContent=s.state||''; $('feed').textContent=s.feed||'';
   $('balance').textContent=s.balance.toFixed(2); $('equity').textContent=s.equity.toFixed(2);
   $('price').textContent=s.price!=null?(''+s.price):'--';
