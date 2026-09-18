@@ -746,10 +746,43 @@ function renderAnalysis(d){
     :`<span><b>${d.side}</b> around ${d.entry.toFixed(5)}</span><span>Illustrative stop ${d.stop.toFixed(5)}</span><span>Illustrative target ${d.target.toFixed(5)}</span>`;
 }
 
-// boot: show TradingView + start the browser Deriv feed for the default market
-renderTV($('symbol').value);
-connectDeriv($('symbol').value);
-setInterval(refresh,1000); refresh();
+// ask Deriv which markets are actually valid + open on this connection, then pick a live one
+function loadSymbols(cb){
+  let ws; try{ ws=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089'); }
+  catch(e){ cb(null); return; }
+  let done=false; const finish=v=>{ if(done)return; done=true; try{ws.close();}catch(e){} cb(v); };
+  ws.onopen=()=>ws.send(JSON.stringify({active_symbols:'brief',product_type:'basic'}));
+  ws.onmessage=ev=>{ let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
+    if(d.error){ finish(null); return; }
+    if(d.msg_type==='active_symbols'){ finish(d.active_symbols||[]); } };
+  ws.onerror=()=>finish(null);
+  setTimeout(()=>finish(null), 8000);
+}
+
+function boot(){
+  loadSymbols(list=>{
+    if(list && list.length){
+      const valid={}; list.forEach(s=>{ valid[s.symbol]={open:!!s.exchange_is_open}; });
+      const sel=$('symbol'); const keep=[];
+      Object.keys(MARKETS_NAME).forEach(sym=>{
+        if(sym==='SIM'){ keep.push([sym, MARKETS_NAME[sym]]); return; }
+        if(valid[sym]){ keep.push([sym, MARKETS_NAME[sym] + (valid[sym].open?'':' (closed)')]); }
+      });
+      if(keep.length) sel.innerHTML=keep.map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
+      let pick=null;
+      for(const [v] of keep){ if(v.charAt(0)==='R' && valid[v] && valid[v].open){ pick=v; break; } }   // prefer an open volatility index (24/7)
+      if(!pick) for(const [v] of keep){ if(v!=='SIM' && valid[v] && valid[v].open){ pick=v; break; } }  // else any open market
+      if(!pick) pick='SIM';                                                                              // else offline simulator
+      sel.value=pick; symTouched=true;
+      fetch('/api/symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:pick})})
+        .finally(()=>{ renderTV(pick); connectDeriv(pick); });
+    } else {
+      renderTV($('symbol').value); connectDeriv($('symbol').value);
+    }
+    setInterval(refresh,1000); refresh();
+  });
+}
+boot();
 </script>
 </body></html>""".replace("__OPTS__", _OPTS).replace("__NAMES__", _NAMES)
 
