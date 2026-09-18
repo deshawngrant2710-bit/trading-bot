@@ -556,6 +556,7 @@ PAGE = r"""<!doctype html>
   <div class="panel pad">
     <div class="botstate" id="botstate">Waiting for data…</div>
     <div class="feed" id="feed"></div>
+    <div class="feed" id="dbg" style="color:var(--idle);word-break:break-all"></div>
     <div class="chartbox"><svg id="botchart" preserveAspectRatio="none"></svg></div>
     <div class="legend">
       <span><i class="dash"></i>Swing high / low (liquidity)</span>
@@ -615,6 +616,7 @@ let symTouched=false;
 
 /* ---------- Deriv live feed (runs in the browser) ---------- */
 let derivWS=null, derivSym=null, feedMsg=null, lastOt=null, lastPost=0;
+let dbgMsg=''; function dbg(t){ dbgMsg=t; }
 function stopDeriv(){ if(derivWS){ try{derivWS.close();}catch(e){} derivWS=null; } }
 function connectDeriv(sym){
   stopDeriv();
@@ -623,10 +625,12 @@ function connectDeriv(sym){
   let ws; try{ ws=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089'); }
   catch(e){ feedMsg='could not open connection'; return; }
   derivWS=ws;
-  ws.onopen=()=>{ feedMsg='connected — loading history…';
+  ws.onopen=()=>{ feedMsg='connected — loading history…'; dbg('ws open → requesting '+sym);
     ws.send(JSON.stringify({ticks_history:sym,style:'candles',granularity:60,count:200,end:'latest',subscribe:1})); };
   ws.onmessage=ev=>{
     let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
+    dbg('reply: '+ev.data.slice(0,200));
+    if(d.error){ feedMsg='Deriv error: '+(d.error.message||d.error.code||'unknown'); return; }
     if(d.msg_type==='candles'){
       const rows=(d.candles||[]).map(c=>[Math.floor(c.epoch!=null?c.epoch:c.open_time),+c.open,+c.high,+c.low,+c.close]);
       feedMsg='live: '+(MARKETS_NAME[sym]||sym);
@@ -638,10 +642,10 @@ function connectDeriv(sym){
         fetch('/api/feed/update',{method:'POST',headers:{'Content-Type':'application/json'},
           body:JSON.stringify({ot,o:+o.open,h:+o.high,l:+o.low,c:+o.close})}).catch(()=>{});
       }
-    } else if(d.msg_type==='error'){ feedMsg='Deriv error: '+((d.error&&d.error.message)||'unknown'); }
+    }
   };
-  ws.onclose=()=>{ if(derivWS===ws){ feedMsg='reconnecting…'; setTimeout(()=>{ if(derivSym===sym) connectDeriv(sym); },3000);} };
-  ws.onerror=()=>{ feedMsg='connection error — retrying…'; };
+  ws.onclose=()=>{ dbg('ws closed'); if(derivWS===ws){ feedMsg='reconnecting…'; setTimeout(()=>{ if(derivSym===sym) connectDeriv(sym); },3000);} };
+  ws.onerror=()=>{ dbg('ws error event'); feedMsg='connection error — retrying…'; };
 }
 
 /* ---------- TradingView live chart ---------- */
@@ -698,6 +702,7 @@ async function refresh(){
   renderTV($('symbol').value);
   $('botstate').textContent=s.state||'';
   $('feed').textContent = (s.source==='deriv') ? (feedMsg||'') : 'simulator';
+  $('dbg').textContent = (s.source==='deriv') ? dbgMsg : '';
   $('balance').textContent=s.balance.toFixed(2); $('equity').textContent=s.equity.toFixed(2);
   $('price').textContent=s.price!=null?(''+s.price):'--';
   $('winrate').textContent=s.win_rate+'%'; $('wins').textContent=s.wins; $('losses').textContent=s.losses; $('total').textContent=s.total;
