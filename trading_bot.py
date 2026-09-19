@@ -29,23 +29,52 @@ from datetime import datetime, date, timedelta
 from flask import Flask, jsonify, request
 
 # ----------------------------------------------------------------------------
-# Config
+# Config — Gold Sweep + Reclaim strategy
 # ----------------------------------------------------------------------------
-NOTIONAL       = 100_000
-START_BALANCE  = 10_000.0
-PIVOT          = 2
-R_MULT         = 2.0
-SETUP_EXPIRY   = 2
-MAX_CANDLES    = 220
-CHART_WINDOW   = 60
-TICK_SECONDS   = 0.35     # simulator only
-CANDLE_TICKS   = 6        # simulator only
+NOTIONAL        = 100_000
+START_BALANCE   = 10_000.0
+
+# --- Strategy ---
+PIVOT           = 2       # swing strength (bars each side)
+SETUP_EXPIRY    = 3       # candles allowed to confirm a sweep
+EMA_FAST        = 21      # dynamic S/R + trailing (Dominion Markets, EzDex — most-cited gold EMA)
+EMA_MID         = 50      # confluence
+EMA_TREND       = 200     # HTF-bias filter — non-negotiable per RoboForex/EzDex/pro-scalper
+ATR_LEN         = 14      # volatility measure for stops
+ATR_STOP_BUF    = 0.25    # 0.25× ATR past the sweep wick (avoids the "exact-pip stop-out" gold is famous for)
+ATR_MIN_RANGE   = 0.5     # sweep candle must be at least 0.5× ATR to matter (skips micro-sweeps)
+BODY_MIN_PCT    = 0.40    # confirmation candle's body must be >= 40% of its range
+RSI_LEN         = 14
+RSI_LONG_MAX    = 75      # don't chase longs when already overbought
+RSI_SHORT_MIN   = 25      # don't chase shorts when already oversold
+NEAR_EMA_ATR    = 1.2     # sweep must be within 1.2× ATR of the 21 or 50 EMA (confluence)
+R_MULT_TARGET   = 2.0     # min target = 2R if no opposing liquidity gives better
+BE_AT_R         = 1.0     # move stop to breakeven at +1R
+PARTIAL_AT_R    = 1.0     # take 50% off at +1R (preserves winner even if it reverses)
+PARTIAL_PCT     = 0.50
+TRAIL_WITH_EMA  = True    # runner trails EMA_FAST after breakeven
+
+# --- Risk management ---
+RISK_PCT        = 0.010   # 1% of current balance per trade
+DAILY_LOSS_CAP_R= 2.0     # stop trading for the day after -2R total
+LOSS_STREAK_CAP = 2       # after N consecutive losses, cooldown
+COOLDOWN_CANDLES= 5
+
+# --- Sessions (UTC hours). Gold's edge lives in London + NY; Asia is chop.
+SESSION_START_H = 7       # 07:00 UTC (London open)
+SESSION_END_H   = 20      # 20:00 UTC (NY close-ish)
+
+MAX_CANDLES     = 300
+CHART_WINDOW    = 60
+TICK_SECONDS    = 0.35    # simulator only
+CANDLE_TICKS    = 6       # simulator only
 
 MARKETS = {
+    "frxXAUUSD": "Gold (XAU/USD) — primary",
     "BTCUSDT":   "BTC/USD (24/7)",
     "ETHUSDT":   "ETH/USD (24/7)",
     "SOLUSDT":   "SOL/USD (24/7)",
-    "frxEURUSD": "EUR/USD", "frxGBPJPY": "GBP/JPY", "frxXAUUSD": "Gold",
+    "frxEURUSD": "EUR/USD", "frxGBPJPY": "GBP/JPY",
     "R_75": "Volatility 75", "R_100": "Volatility 100", "R_50": "Volatility 50",
     "R_25": "Volatility 25", "R_10": "Volatility 10",
     "SIM": "Simulator (offline)",
@@ -76,10 +105,16 @@ class TradingBot:
         self.running = False
         self.lot = 0.10
         self.source = "deriv"
-        self.symbol = "BTCUSDT"
+        self.symbol = "frxXAUUSD"
         self.balance = START_BALANCE
         self.trades = []
         self.thread = None
+        # session/risk state
+        self.session_pnl_r = 0.0        # running R for today
+        self.session_day = None         # UTC day the counter is for
+        self.streak_losses = 0          # consecutive losses
+        self.cooldown_until = -1        # candle index the cooldown ends at
+        self.blocked_reason = None      # why we're not taking new trades right now
         self._reset_market()
 
     def _reset_market(self):
@@ -95,7 +130,48 @@ class TradingBot:
         self.events = []
         self.last_price = None
 
-    # ---- strategy pieces --------------------------------------------------
+    # ---- indicators -------------------------------------------------------
+    def _ema(self, length, offset=0):
+        """EMA of closes ending at the candle at -1-offset. Returns None if not enough data."""
+        n = len(self.candles) - offset
+        if n < length:
+            return None
+        k = 2 / (length + 1)
+        # seed with SMA of first `length` closes, then walk forward
+        vals = [c["c"] for c in self.candles[:n]]
+        ema = sum(vals[:length]) / length
+        for v in vals[length:]:
+            ema = v * k + ema * (1 - k)
+        return ema
+
+    def _atr(self, n=ATR_LEN):
+        cs = self.candles[-(n + 1):]
+        if len(cs) < 2:
+            return None
+        trs = []
+        for i in range(1, len(cs)):
+            h, l, pc = cs[i]["h"], cs[i]["l"], cs[i - 1]["c"]
+            trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+        trs = trs[-n:]
+        return sum(trs) / len(trs) if trs else None
+
+    def _rsi(self, n=RSI_LEN):
+        cs = self.candles
+        if len(cs) < n + 1:
+            return None
+        gains, losses = [], []
+        for i in range(1, len(cs)):
+            ch = cs[i]["c"] - cs[i - 1]["c"]
+            gains.append(max(ch, 0.0)); losses.append(max(-ch, 0.0))
+        ag = sum(gains[:n]) / n; al = sum(losses[:n]) / n
+        for i in range(n, len(gains)):
+            ag = (ag * (n - 1) + gains[i]) / n
+            al = (al * (n - 1) + losses[i]) / n
+        if al == 0:
+            return 100.0
+        return 100 - 100 / (1 + ag / al)
+
+    # ---- market structure (swings) ----------------------------------------
     def _rebuild_swings(self):
         self.swing_highs, self.swing_lows = [], []
         cs = self.candles
@@ -120,16 +196,85 @@ class TradingBot:
         if mid["l"] == min(ls) and ls.count(mid["l"]) == 1:
             self.swing_lows.append((mid["i"], mid["l"])); self.swing_lows = self.swing_lows[-40:]
 
+    # ---- filters (the "smart" part) ---------------------------------------
+    def _in_session(self, candle_ot):
+        """Only London + NY sessions (UTC). Skip Asia chop. Applies only to time-based feeds."""
+        # For crypto (24/7) or the simulator, don't apply time filter.
+        if self.source == "sim" or self.symbol in BINANCE_MARKETS:
+            return True
+        if candle_ot is None:
+            return True
+        h = datetime.utcfromtimestamp(candle_ot).hour
+        return SESSION_START_H <= h <= SESSION_END_H
+
+    def _htf_bias(self):
+        """+1 for long-only, -1 for short-only, 0 for no clear bias (skip trades)."""
+        ema200 = self._ema(EMA_TREND)
+        if ema200 is None:
+            return 0
+        price = self.candles[-1]["c"]
+        return 1 if price > ema200 else -1
+
+    def _near_ema_confluence(self, price):
+        """The sweep should happen near dynamic S/R (21 or 50 EMA) — that's what makes it a real POI."""
+        atr = self._atr()
+        e21 = self._ema(EMA_FAST); e50 = self._ema(EMA_MID)
+        if atr is None or (e21 is None and e50 is None):
+            return False
+        thr = NEAR_EMA_ATR * atr
+        return (e21 is not None and abs(price - e21) <= thr) or (e50 is not None and abs(price - e50) <= thr)
+
+    def _rsi_allows(self, direction):
+        r = self._rsi()
+        if r is None:
+            return True
+        return r <= RSI_LONG_MAX if direction == "long" else r >= RSI_SHORT_MIN
+
+    def _touch_daily_state(self, candle_ot):
+        """Reset daily risk counter at UTC day boundary."""
+        if candle_ot is None:
+            return
+        day = datetime.utcfromtimestamp(candle_ot).date()
+        if self.session_day != day:
+            self.session_day = day
+            self.session_pnl_r = 0.0
+
+    def _risk_allows_new_trade(self):
+        """Composite: daily loss cap + cooldown after losing streak."""
+        self.blocked_reason = None
+        if self.session_pnl_r <= -DAILY_LOSS_CAP_R:
+            self.blocked_reason = f"Daily loss cap hit ({self.session_pnl_r:.2f}R) — no new trades today"
+            return False
+        if self.idx < self.cooldown_until:
+            left = self.cooldown_until - self.idx
+            self.blocked_reason = f"Cooldown after {LOSS_STREAK_CAP} losses — {left} candle(s) left"
+            return False
+        return True
+
+    # ---- sweep -> confirm -> entry (with all filters) ---------------------
     def _detect_sweep(self, c):
-        if self.swing_lows:
+        if not self._risk_allows_new_trade():
+            return
+        if not self._in_session(c.get("ot")):
+            return
+        bias = self._htf_bias()
+        atr = self._atr() or 0
+        if atr <= 0:
+            return
+        c_range = c["h"] - c["l"]
+        if c_range < ATR_MIN_RANGE * atr:      # micro-sweep — skip
+            return
+        # sell-side sweep -> long setup
+        if bias >= 0 and self.swing_lows:
             _, low = self.swing_lows[-1]
-            if c["l"] < low and c["c"] > low:
+            if c["l"] < low and c["c"] > low and self._near_ema_confluence(c["l"]):
                 self.pending = {"dir": "long", "extreme": c["l"], "expiry": self.idx + SETUP_EXPIRY}
                 self.events.append({"i": c["i"], "type": "sweep_low", "price": c["l"]}); self.events = self.events[-30:]
                 return
-        if self.swing_highs:
+        # buy-side sweep -> short setup
+        if bias <= 0 and self.swing_highs:
             _, high = self.swing_highs[-1]
-            if c["h"] > high and c["c"] < high:
+            if c["h"] > high and c["c"] < high and self._near_ema_confluence(c["h"]):
                 self.pending = {"dir": "short", "extreme": c["h"], "expiry": self.idx + SETUP_EXPIRY}
                 self.events.append({"i": c["i"], "type": "sweep_high", "price": c["h"]}); self.events = self.events[-30:]
 
@@ -137,53 +282,124 @@ class TradingBot:
         p = self.pending
         if self.idx > p["expiry"]:
             self.pending = None; return
+        body = abs(c["c"] - c["o"])
+        rng = max(c["h"] - c["l"], 1e-9)
+        strong = (body / rng) >= BODY_MIN_PCT
         if p["dir"] == "long":
-            if c["c"] < p["extreme"]: self.pending = None
-            elif c["c"] > c["o"]: self._enter("long", c["c"], p["extreme"])
+            if c["c"] < p["extreme"]:                       # closed back below the wick -> real breakdown
+                self.pending = None; return
+            if c["c"] > c["o"] and strong and self._rsi_allows("long"):
+                self._enter("long", c["c"], p["extreme"])
         else:
-            if c["c"] > p["extreme"]: self.pending = None
-            elif c["c"] < c["o"]: self._enter("short", c["c"], p["extreme"])
-
-    def _atr(self, n=14):
-        cs = self.candles[-n:]
-        return sum(x["h"] - x["l"] for x in cs) / len(cs) if len(cs) >= 2 else None
+            if c["c"] > p["extreme"]:
+                self.pending = None; return
+            if c["c"] < c["o"] and strong and self._rsi_allows("short"):
+                self._enter("short", c["c"], p["extreme"])
 
     def _target(self, direction, entry, risk):
+        # target = opposite liquidity OR 2R, whichever is farther (better RR)
+        two_r = entry + R_MULT_TARGET * risk if direction == "long" else entry - R_MULT_TARGET * risk
         if direction == "long":
             highs = [lv for _, lv in self.swing_highs if lv > entry]
-            if highs and min(highs) - entry >= risk: return min(highs)
-            return entry + R_MULT * risk
+            if highs:
+                pool = min(highs)
+                return max(pool, two_r) if pool - entry >= risk else two_r
+            return two_r
         lows = [lv for _, lv in self.swing_lows if lv < entry]
-        if lows and entry - max(lows) >= risk: return max(lows)
-        return entry - R_MULT * risk
+        if lows:
+            pool = max(lows)
+            return min(pool, two_r) if entry - pool >= risk else two_r
+        return two_r
+
+    def _position_size(self, entry, stop):
+        """Fixed-% risk sizing. Lot is the equivalent notional units for return-based P&L."""
+        risk_per_unit = abs(entry - stop) / entry           # % move to stop
+        if risk_per_unit <= 0:
+            return None
+        dollars_at_risk = self.balance * RISK_PCT
+        # dollars_at_risk = (risk_per_unit) * lot * NOTIONAL
+        lot = dollars_at_risk / (risk_per_unit * NOTIONAL)
+        return round(max(0.01, lot), 3)
 
     def _enter(self, direction, price, extreme):
-        buf = max((self._atr() or price * 0.0005) * 0.25, price * 1e-6)
-        if direction == "long": stop = extreme - buf; risk = price - stop
-        else: stop = extreme + buf; risk = stop - price
-        if risk <= 0: self.pending = None; return
+        atr = self._atr() or price * 0.001
+        buf = ATR_STOP_BUF * atr
+        if direction == "long":
+            stop = extreme - buf; risk = price - stop
+        else:
+            stop = extreme + buf; risk = stop - price
+        if risk <= 0:
+            self.pending = None; return
         target = self._target(direction, price, risk)
+        lot = self._position_size(price, stop)
+        if lot is None:
+            self.pending = None; return
+        self.lot = lot   # visible in the UI
         self.position = {"dir": direction, "entry": round(price, 5), "stop": round(stop, 5),
-                         "target": round(target, 5), "lot": self.lot, "i": self.idx}
+                         "target": round(target, 5), "lot": lot, "i": self.idx,
+                         "risk": risk, "orig_stop": round(stop, 5),
+                         "partial_done": False, "be_moved": False}
         self.events.append({"i": self.idx, "type": "entry", "price": price}); self.events = self.events[-30:]
         self.pending = None
 
     def _pnl(self, entry, exit_, d, lot):
         return round((exit_ / entry - 1) * d * lot * NOTIONAL, 2)
 
+    def _manage_position(self, high, low, close):
+        """Runs every candle after entry: partial TP, breakeven, EMA trail."""
+        pos = self.position
+        if not pos:
+            return
+        d = 1 if pos["dir"] == "long" else -1
+        risk = pos["risk"]
+        r1 = pos["entry"] + d * risk           # +1R level
+        # partial TP + move to breakeven at +1R
+        hit_1r = (high >= r1) if d == 1 else (low <= r1)
+        if hit_1r and not pos["partial_done"]:
+            half = round(pos["lot"] * PARTIAL_PCT, 3)
+            pnl = self._pnl(pos["entry"], r1, d, half)
+            self.balance += pnl
+            self.trades.append({"id": len(self.trades) + 1, "side": "BUY" if d == 1 else "SELL",
+                                "lot": half, "entry": pos["entry"], "exit": round(r1, 5),
+                                "pnl": pnl, "result": "WIN", "reason": "TP1 (partial)",
+                                "closed": datetime.now().strftime("%H:%M:%S")})
+            self.session_pnl_r += PARTIAL_PCT * 1.0
+            pos["lot"] = round(pos["lot"] - half, 3)
+            pos["partial_done"] = True
+            pos["be_moved"] = True
+            pos["stop"] = pos["entry"]         # breakeven
+        # EMA trail on the runner (only after breakeven)
+        if TRAIL_WITH_EMA and pos["be_moved"]:
+            e21 = self._ema(EMA_FAST)
+            if e21 is not None:
+                if d == 1 and e21 > pos["stop"]:
+                    pos["stop"] = round(e21, 5)
+                elif d == -1 and e21 < pos["stop"]:
+                    pos["stop"] = round(e21, 5)
+
     def _check_exit(self, high, low):
         pos = self.position
-        if not pos: return
+        if not pos:
+            return
         if pos["dir"] == "long":
-            if low <= pos["stop"]: self._close(pos["stop"], "SL")
+            if low <= pos["stop"]: self._close(pos["stop"], "SL" if not pos["be_moved"] else "BE/Trail")
             elif high >= pos["target"]: self._close(pos["target"], "TP")
         else:
-            if high >= pos["stop"]: self._close(pos["stop"], "SL")
+            if high >= pos["stop"]: self._close(pos["stop"], "SL" if not pos["be_moved"] else "BE/Trail")
             elif low <= pos["target"]: self._close(pos["target"], "TP")
 
     def _close(self, price, reason):
         pos = self.position; d = 1 if pos["dir"] == "long" else -1
         pnl = self._pnl(pos["entry"], price, d, pos["lot"]); self.balance += pnl
+        r_realized = (pnl / (self.balance * RISK_PCT)) if self.balance > 0 else 0
+        # Update risk state
+        self.session_pnl_r += r_realized
+        if reason.startswith("SL") and pnl < 0:
+            self.streak_losses += 1
+            if self.streak_losses >= LOSS_STREAK_CAP:
+                self.cooldown_until = self.idx + COOLDOWN_CANDLES
+        elif pnl > 0:
+            self.streak_losses = 0
         self.trades.append({"id": len(self.trades) + 1, "side": "BUY" if d == 1 else "SELL",
                             "lot": pos["lot"], "entry": pos["entry"], "exit": round(price, 5),
                             "pnl": pnl, "result": "WIN" if pnl >= 0 else "LOSS",
@@ -191,29 +407,42 @@ class TradingBot:
         self.position = None
 
     def _trade_on_candle(self, c):
-        if self.position: self._check_exit(c["h"], c["l"])
-        elif self.pending: self._try_confirm(c)
-        else: self._detect_sweep(c)
+        self._touch_daily_state(c.get("ot"))
+        if self.position:
+            self._manage_position(c["h"], c["l"], c["c"])
+            self._check_exit(c["h"], c["l"])
+        elif self.pending:
+            self._try_confirm(c)
+        else:
+            self._detect_sweep(c)
 
     def _state(self):
         if not self.running:
             return "Live data streaming — press Start to trade" if self.candles else "Waiting for data…"
         if self.position:
             p = self.position
-            return f"In {p['dir'].upper()} @ {p['entry']} · SL {p['stop']} · TP {p['target']}"
+            tag = " · partial taken, runner at BE" if p.get("partial_done") else ""
+            return f"In {p['dir'].upper()} @ {p['entry']} · SL {p['stop']} · TP {p['target']}{tag}"
         if self.pending:
             k = "sell-side" if self.pending["dir"] == "long" else "buy-side"
             return f"{k} sweep @ {round(self.pending['extreme'],5)} — waiting for a confirming candle"
+        if self.blocked_reason:
+            return self.blocked_reason
+        bias = self._htf_bias(); atr = self._atr()
+        b = {1:"BULLISH", -1:"BEARISH", 0:"NEUTRAL"}[bias]
         sh = self.swing_highs[-1][1] if self.swing_highs else None
         sl = self.swing_lows[-1][1] if self.swing_lows else None
-        return f"Watching liquidity — resting high {sh} / low {sl}"
+        return f"Bias {b} · ATR {round(atr,2) if atr else '—'} · resting high {sh} / low {sl}"
 
     def _finalize(self, done):
+        # attach open_time on the finalized candle so filters can read it
+        if "ot" not in done and self.cur_ot is not None:
+            done["ot"] = self.cur_ot
         self.candles.append(done)
         if len(self.candles) > MAX_CANDLES: self.candles.pop(0)
         self.idx += 1
-        self._detect_swings()          # market structure updates always
-        if self.running:               # trading only when started
+        self._detect_swings()
+        if self.running:
             self._trade_on_candle(done)
 
     # ---- data intake from the browser (Deriv) -----------------------------
@@ -221,12 +450,16 @@ class TradingBot:
         with self.lock:
             if self.source != "deriv":
                 return
-            self.candles = [{"i": i, "o": r[1], "h": r[2], "l": r[3], "c": r[4]}
+            # rows are (ot, o, h, l, c)
+            self.candles = [{"i": i, "ot": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4]}
                             for i, r in enumerate(rows)][-MAX_CANDLES:]
             self.idx = len(self.candles)
             self.cur = None; self.cur_ot = None
             self._rebuild_swings()
             self.last_price = self.candles[-1]["c"] if self.candles else None
+            # daily counter aligns to the last-seen day
+            if self.candles:
+                self._touch_daily_state(self.candles[-1]["ot"])
 
     def update(self, ot, o, h, l, c):
         with self.lock:
@@ -236,7 +469,8 @@ class TradingBot:
             if self.cur_ot is None or ot == self.cur_ot:
                 self.cur_ot = ot; self.cur = {"o": o, "h": h, "l": l, "c": c}
             else:
-                done = {"i": self.idx, **{k: round(v, 6) for k, v in self.cur.items()}}
+                done = {"i": self.idx, "ot": self.cur_ot,
+                        **{k: round(v, 6) for k, v in self.cur.items()}}
                 self._finalize(done)
                 self.cur_ot = ot; self.cur = {"o": o, "h": h, "l": l, "c": c}
             if self.running and self.position and self.cur:
@@ -441,7 +675,7 @@ def api_lot():
 
 @app.route("/api/symbol", methods=["POST"])
 def api_symbol():
-    bot.set_symbol(request.json.get("symbol", "BTCUSDT")); return jsonify(ok=True, symbol=bot.symbol)
+    bot.set_symbol(request.json.get("symbol", "frxXAUUSD")); return jsonify(ok=True, symbol=bot.symbol)
 
 
 @app.route("/api/feed/seed", methods=["POST"])
@@ -539,7 +773,7 @@ PAGE = r"""<!doctype html>
 
   <div class="bar">
     <span class="dot" id="dot"></span><span class="state" id="state">STOPPED</span>
-    <span class="badge">Liquidity Sweep</span>
+    <span class="badge">Gold Sweep + Reclaim</span>
     <label for="symbol" style="margin-left:6px">Market</label>
     <select id="symbol" onchange="setSymbol()">__OPTS__</select>
     <span class="grow"></span>
