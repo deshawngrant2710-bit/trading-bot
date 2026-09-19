@@ -615,25 +615,81 @@ const css=v=>getComputedStyle(document.documentElement).getPropertyValue(v).trim
 let symTouched=false;
 
 /* ---------- Deriv live feed (runs in the browser) ---------- */
+// The dropdown values are stable app market IDs. The real Deriv code is resolved at runtime from
+// active_symbols by the market's display name, so the label stays "Volatility 50" while the backend
+// uses whatever underlying_symbol Deriv currently returns.
+const DERIV_WS='wss://ws.derivws.com/websockets/v3?app_id=1089';
+const MATCH={   // market id -> Deriv display names (compared lowercase, exact)
+  frxEURUSD:['eur/usd'], frxGBPJPY:['gbp/jpy'], frxXAUUSD:['gold/usd','gold'],
+  R_10:['volatility 10 index'], R_25:['volatility 25 index'], R_50:['volatility 50 index'],
+  R_75:['volatility 75 index'], R_100:['volatility 100 index']
+};
 let derivWS=null, derivSym=null, feedMsg=null, lastOt=null, lastPost=0;
 let dbgMsg=''; function dbg(t){ dbgMsg=t; }
+let symbolsCache=null, unavailable={};
+
+// New-API field names first (underlying_symbol / underlying_symbol_name), legacy fallbacks second
+function normSym(s){ return { code:s.underlying_symbol||s.symbol||'', name:(s.underlying_symbol_name||s.display_name||'').toLowerCase().trim(), open:!!s.exchange_is_open }; }
+
+function loadSymbols(cb){
+  if(symbolsCache){ cb(symbolsCache); return; }
+  let ws; try{ ws=new WebSocket(DERIV_WS); }catch(e){ cb(null); return; }
+  let done=false; const finish=v=>{ if(done)return; done=true; try{ws.close();}catch(e){} cb(v); };
+  ws.onopen=()=>ws.send(JSON.stringify({active_symbols:'brief'}));   // New API: no product_type / landing_company params
+  ws.onmessage=ev=>{ let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
+    if(d.error){ dbg('active_symbols error: '+(d.error.message||d.error.code||'unknown')); finish(null); return; }
+    if(d.msg_type==='active_symbols'){ symbolsCache=(d.active_symbols||[]).map(normSym); finish(symbolsCache); } };
+  ws.onerror=()=>finish(null);
+  setTimeout(()=>finish(null),8000);
+}
+
+// Find the live Deriv underlying_symbol for a market id by its display name
+function resolveMarket(list,id){
+  const names=MATCH[id]; if(!names||!list) return null;
+  for(const n of names){ const hit=list.find(s=>s.name===n); if(hit&&hit.code) return hit; }
+  return null;
+}
+
 function stopDeriv(){ if(derivWS){ try{derivWS.close();}catch(e){} derivWS=null; } }
-function connectDeriv(sym){
+
+function connectDeriv(id){
   stopDeriv();
-  if(!sym || sym==='SIM'){ feedMsg=null; return; }
-  derivSym=sym; feedMsg='connecting to Deriv…';
-  let ws; try{ ws=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089'); }
-  catch(e){ feedMsg='could not open connection'; return; }
+  if(!id || id==='SIM'){ feedMsg=null; return; }
+  derivSym=id;
+  if(unavailable[id]){ feedMsg=MARKETS_NAME[id]+' is unavailable on this Deriv connection.'; return; }
+  feedMsg='resolving market…';
+  loadSymbols(list=>{
+    if(derivSym!==id) return;
+    if(!list){ feedMsg='could not load the Deriv market list — retrying…'; setTimeout(()=>{ if(derivSym===id) connectDeriv(id); },5000); return; }
+    const m=resolveMarket(list,id);
+    if(!m){ unavailable[id]=true; feedMsg=MARKETS_NAME[id]+' is unavailable on this Deriv connection.';
+      dbg('no active symbol named: '+(MATCH[id]||[]).join(' / ')); return; }
+    dbg('resolved '+MARKETS_NAME[id]+' → '+m.code+(m.open?'':' (market closed)'));
+    streamCandles(id,m.code,m.open);
+  });
+}
+
+function streamCandles(id,code,open){
+  feedMsg='connecting to Deriv…';
+  let ws; try{ ws=new WebSocket(DERIV_WS); }catch(e){ feedMsg='could not open connection'; return; }
   derivWS=ws;
-  ws.onopen=()=>{ feedMsg='connected — loading history…'; dbg('ws open → requesting '+sym);
-    ws.send(JSON.stringify({ticks_history:sym,style:'candles',granularity:60,count:200,end:'latest',subscribe:1})); };
+  ws.onopen=()=>{ feedMsg='connected — loading history…';
+    ws.send(JSON.stringify({ticks_history:code,style:'candles',granularity:60,count:200,end:'latest',subscribe:1})); };
   ws.onmessage=ev=>{
     let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
     dbg('reply: '+ev.data.slice(0,200));
-    if(d.error){ feedMsg='Deriv error: '+(d.error.message||d.error.code||'unknown'); return; }
+    if(d.error){
+      const c=d.error.code||'';
+      if(c==='InvalidSymbol'){   // do not retry an invalid symbol; drop the stale market list
+        unavailable[id]=true; symbolsCache=null; derivWS=null;
+        feedMsg=MARKETS_NAME[id]+' is unavailable on this Deriv connection.';
+        try{ws.close();}catch(e){} return;
+      }
+      feedMsg='Deriv error: '+(d.error.message||c||'unknown'); return;
+    }
     if(d.msg_type==='candles'){
       const rows=(d.candles||[]).map(c=>[Math.floor(c.epoch!=null?c.epoch:c.open_time),+c.open,+c.high,+c.low,+c.close]);
-      feedMsg='live: '+(MARKETS_NAME[sym]||sym);
+      feedMsg=(open?'live: ':'market closed — last session: ')+MARKETS_NAME[id]+' · '+code;
       fetch('/api/feed/seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rows})}).catch(()=>{});
     } else if(d.msg_type==='ohlc'){
       const o=d.ohlc, ot=Math.floor(o.open_time!=null?o.open_time:o.epoch);
@@ -644,9 +700,13 @@ function connectDeriv(sym){
       }
     }
   };
-  ws.onclose=()=>{ dbg('ws closed'); if(derivWS===ws){ feedMsg='reconnecting…'; setTimeout(()=>{ if(derivSym===sym) connectDeriv(sym); },3000);} };
+  ws.onclose=()=>{ dbg('ws closed'); if(derivWS===ws && !unavailable[id]){ feedMsg='reconnecting…'; setTimeout(()=>{ if(derivSym===id) connectDeriv(id); },3000);} };
   ws.onerror=()=>{ dbg('ws error event'); feedMsg='connection error — retrying…'; };
 }
+
+// Deriv's New API expects `underlying_symbol` (not `symbol`) on trading calls such as proposal.
+// This app is paper-only and never sends these; the helper documents the correct field for any future live wiring.
+function derivProposalRequest(code,extra){ return Object.assign({proposal:1,underlying_symbol:code},extra||{}); }
 
 /* ---------- TradingView live chart ---------- */
 const TV_MAP={frxEURUSD:'OANDA:EURUSD',frxGBPJPY:'OANDA:GBPJPY',frxXAUUSD:'OANDA:XAUUSD'};
@@ -667,6 +727,7 @@ async function call(a){ await fetch('/api/'+a,{method:'POST'}); refresh(); }
 async function setLot(){ await fetch('/api/lot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lot:parseFloat($('lot').value)||0.1})}); }
 async function setSymbol(){
   symTouched=true; const sym=$('symbol').value;
+  delete unavailable[sym];   // a deliberate re-select is allowed to retry once (with a fresh market list)
   await fetch('/api/symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:sym})});
   renderTV(sym); connectDeriv(sym); refresh();
 }
@@ -746,41 +807,11 @@ function renderAnalysis(d){
     :`<span><b>${d.side}</b> around ${d.entry.toFixed(5)}</span><span>Illustrative stop ${d.stop.toFixed(5)}</span><span>Illustrative target ${d.target.toFixed(5)}</span>`;
 }
 
-// ask Deriv which markets are actually valid + open on this connection, then pick a live one
-function loadSymbols(cb){
-  let ws; try{ ws=new WebSocket('wss://ws.derivws.com/websockets/v3?app_id=1089'); }
-  catch(e){ cb(null); return; }
-  let done=false; const finish=v=>{ if(done)return; done=true; try{ws.close();}catch(e){} cb(v); };
-  ws.onopen=()=>ws.send(JSON.stringify({active_symbols:'brief',product_type:'basic'}));
-  ws.onmessage=ev=>{ let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
-    if(d.error){ finish(null); return; }
-    if(d.msg_type==='active_symbols'){ finish(d.active_symbols||[]); } };
-  ws.onerror=()=>finish(null);
-  setTimeout(()=>finish(null), 8000);
-}
-
+// boot: TradingView for the selected market, and start the browser Deriv feed (symbol resolved via active_symbols)
 function boot(){
-  loadSymbols(list=>{
-    if(list && list.length){
-      const valid={}; list.forEach(s=>{ valid[s.symbol]={open:!!s.exchange_is_open}; });
-      const sel=$('symbol'); const keep=[];
-      Object.keys(MARKETS_NAME).forEach(sym=>{
-        if(sym==='SIM'){ keep.push([sym, MARKETS_NAME[sym]]); return; }
-        if(valid[sym]){ keep.push([sym, MARKETS_NAME[sym] + (valid[sym].open?'':' (closed)')]); }
-      });
-      if(keep.length) sel.innerHTML=keep.map(([v,t])=>`<option value="${v}">${t}</option>`).join('');
-      let pick=null;
-      for(const [v] of keep){ if(v.charAt(0)==='R' && valid[v] && valid[v].open){ pick=v; break; } }   // prefer an open volatility index (24/7)
-      if(!pick) for(const [v] of keep){ if(v!=='SIM' && valid[v] && valid[v].open){ pick=v; break; } }  // else any open market
-      if(!pick) pick='SIM';                                                                              // else offline simulator
-      sel.value=pick; symTouched=true;
-      fetch('/api/symbol',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({symbol:pick})})
-        .finally(()=>{ renderTV(pick); connectDeriv(pick); });
-    } else {
-      renderTV($('symbol').value); connectDeriv($('symbol').value);
-    }
-    setInterval(refresh,1000); refresh();
-  });
+  renderTV($('symbol').value);
+  connectDeriv($('symbol').value);
+  setInterval(refresh,1000); refresh();
 }
 boot();
 </script>
