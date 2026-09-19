@@ -618,7 +618,7 @@ let symTouched=false;
 // The dropdown values are stable app market IDs. The real Deriv code is resolved at runtime from
 // active_symbols by the market's display name, so the label stays "Volatility 50" while the backend
 // uses whatever underlying_symbol Deriv currently returns.
-const DERIV_WS='wss://ws.derivws.com/websockets/v3?app_id=1089';
+const DERIV_WS='wss://ws.derivws.com/websockets/v3?app_id=34ryJ2faZYgnr2l1Xn0Jr';
 const MATCH={   // market id -> Deriv display names (compared lowercase, exact)
   frxEURUSD:['eur/usd'], frxGBPJPY:['gbp/jpy'], frxXAUUSD:['gold/usd','gold'],
   R_10:['volatility 10 index'], R_25:['volatility 25 index'], R_50:['volatility 50 index'],
