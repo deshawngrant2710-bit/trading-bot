@@ -42,11 +42,16 @@ TICK_SECONDS   = 0.35     # simulator only
 CANDLE_TICKS   = 6        # simulator only
 
 MARKETS = {
+    "BTCUSDT":   "BTC/USD (24/7)",
+    "ETHUSDT":   "ETH/USD (24/7)",
+    "SOLUSDT":   "SOL/USD (24/7)",
     "frxEURUSD": "EUR/USD", "frxGBPJPY": "GBP/JPY", "frxXAUUSD": "Gold",
     "R_75": "Volatility 75", "R_100": "Volatility 100", "R_50": "Volatility 50",
     "R_25": "Volatility 25", "R_10": "Volatility 10",
     "SIM": "Simulator (offline)",
 }
+# Which source each market uses (server treats crypto/deriv the same — data arrives from the browser)
+BINANCE_MARKETS = {"BTCUSDT", "ETHUSDT", "SOLUSDT"}
 
 
 class SimulatedBroker:
@@ -71,7 +76,7 @@ class TradingBot:
         self.running = False
         self.lot = 0.10
         self.source = "deriv"
-        self.symbol = "frxEURUSD"
+        self.symbol = "BTCUSDT"
         self.balance = START_BALANCE
         self.trades = []
         self.thread = None
@@ -436,7 +441,7 @@ def api_lot():
 
 @app.route("/api/symbol", methods=["POST"])
 def api_symbol():
-    bot.set_symbol(request.json.get("symbol", "frxEURUSD")); return jsonify(ok=True, symbol=bot.symbol)
+    bot.set_symbol(request.json.get("symbol", "BTCUSDT")); return jsonify(ok=True, symbol=bot.symbol)
 
 
 @app.route("/api/feed/seed", methods=["POST"])
@@ -618,7 +623,7 @@ let symTouched=false;
 // The dropdown values are stable app market IDs. The real Deriv code is resolved at runtime from
 // active_symbols by the market's display name, so the label stays "Volatility 50" while the backend
 // uses whatever underlying_symbol Deriv currently returns.
-const DERIV_WS='wss://ws.derivws.com/websockets/v3?app_id=34ryJ2faZYgnr2l1Xn0Jr';
+const DERIV_WS='wss://ws.derivws.com/websockets/v3?app_id=1089';
 const MATCH={   // market id -> Deriv display names (compared lowercase, exact)
   frxEURUSD:['eur/usd'], frxGBPJPY:['gbp/jpy'], frxXAUUSD:['gold/usd','gold'],
   R_10:['volatility 10 index'], R_25:['volatility 25 index'], R_50:['volatility 50 index'],
@@ -650,12 +655,15 @@ function resolveMarket(list,id){
   return null;
 }
 
+const BINANCE={BTCUSDT:1,ETHUSDT:1,SOLUSDT:1};
+
 function stopDeriv(){ if(derivWS){ try{derivWS.close();}catch(e){} derivWS=null; } }
 
 function connectDeriv(id){
   stopDeriv();
   if(!id || id==='SIM'){ feedMsg=null; return; }
   derivSym=id;
+  if(BINANCE[id]){ streamBinance(id); return; }
   if(unavailable[id]){ feedMsg=MARKETS_NAME[id]+' is unavailable on this Deriv connection.'; return; }
   feedMsg='resolving market…';
   loadSymbols(list=>{
@@ -706,10 +714,43 @@ function streamCandles(id,code,open){
 
 // Deriv's New API expects `underlying_symbol` (not `symbol`) on trading calls such as proposal.
 // This app is paper-only and never sends these; the helper documents the correct field for any future live wiring.
+// Binance public market data — no account, no key, 24/7. Streams 1-minute klines.
+function streamBinance(id){
+  feedMsg='connecting to Binance…';
+  const sym=id.toLowerCase();
+  // 1) seed with recent history via REST, so the strategy chart has data instantly
+  fetch('https://api.binance.com/api/v3/klines?symbol='+id+'&interval=1m&limit=200')
+    .then(r=>r.json())
+    .then(rows=>{
+      if(derivSym!==id) return;
+      const seed=(rows||[]).map(k=>[Math.floor(k[0]/1000),+k[1],+k[2],+k[3],+k[4]]);
+      dbg('binance history: '+seed.length+' candles');
+      fetch('/api/feed/seed',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({rows:seed})}).catch(()=>{});
+    }).catch(e=>dbg('binance history failed: '+e));
+  // 2) live stream — one message per second per kline; we forward closes/highs/lows
+  let ws; try{ ws=new WebSocket('wss://stream.binance.com:9443/ws/'+sym+'@kline_1m'); }
+  catch(e){ feedMsg='could not open Binance connection'; return; }
+  derivWS=ws;
+  ws.onopen=()=>{ feedMsg='live: '+MARKETS_NAME[id]; };
+  ws.onmessage=ev=>{
+    let d; try{ d=JSON.parse(ev.data); }catch(e){ return; }
+    const k=d && d.k; if(!k) return;
+    const ot=Math.floor(k.t/1000);
+    if(ot!==lastOt || performance.now()-lastPost>500){
+      lastOt=ot; lastPost=performance.now();
+      fetch('/api/feed/update',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ot,o:+k.o,h:+k.h,l:+k.l,c:+k.c})}).catch(()=>{});
+    }
+  };
+  ws.onclose=()=>{ dbg('binance ws closed'); if(derivWS===ws){ feedMsg='reconnecting…'; setTimeout(()=>{ if(derivSym===id) connectDeriv(id); },3000);} };
+  ws.onerror=()=>{ dbg('binance ws error'); feedMsg='connection error — retrying…'; };
+}
+
 function derivProposalRequest(code,extra){ return Object.assign({proposal:1,underlying_symbol:code},extra||{}); }
 
 /* ---------- TradingView live chart ---------- */
-const TV_MAP={frxEURUSD:'OANDA:EURUSD',frxGBPJPY:'OANDA:GBPJPY',frxXAUUSD:'OANDA:XAUUSD'};
+const TV_MAP={frxEURUSD:'OANDA:EURUSD',frxGBPJPY:'OANDA:GBPJPY',frxXAUUSD:'OANDA:XAUUSD',
+              BTCUSDT:'BINANCE:BTCUSDT',ETHUSDT:'BINANCE:ETHUSDT',SOLUSDT:'BINANCE:SOLUSDT'};
 let tvCur=null;
 function renderTV(sym){
   const tv=TV_MAP[sym];
